@@ -135,6 +135,14 @@ try {
       new Notice("Fractal Index: canceled.");
     } else {
       const createSub = scope === "self+create";
+      const RL = (app.metadataCache && app.metadataCache.resolvedLinks) || {};
+      if (drawLinks === undefined) {
+        drawLinks = await utils.suggester(
+          ["With note-link arrows (ExcaliBrain dimension)", "Without link arrows"],
+          [true, false],
+          "Draw arrows between notes that link to each other?"
+        );
+      }
 
       /* scan folder */
       const children = folder.children || [];
@@ -355,6 +363,100 @@ try {
          Uses app.metadataCache.resolvedLinks. Mutual links collapse into a
          double-headed arrow; file↔subfolder links become card↔pod arrows.
          Positions derive from stable card geometry → arrows are deterministic. */
+      /* ── ExcaliBrain dimension: note-link arrows from real wikilinks ──
+         Mutual links merge into double-headed arrows; file↔subfolder links
+         become card↔pod arrows, including pod→pod bridges. */
+      if (drawLinks) {
+        const cardRect = new Map();
+        for (const f of filesCapped) {
+          const el = ea.getElement(sid("file|" + f.path));
+          if (el) cardRect.set(f.path, { x: el.x - 10, y: el.y - 10, w: el.width + 20, h: el.height + 20 });
+        }
+        for (const sf of subfoldersCapped) {
+          const p = slotPos.pod(podSlots.get(sf.path));
+          cardRect.set(sf.path + "/", { x: p.x, y: p.y, w: CFG.pod.w, h: CFG.pod.h });
+        }
+        const podKeys = subfoldersCapped.map((sf) => sf.path);
+        const edges = new Map();
+        const addEdge = (src, dst, w) => {
+          const k = src + "=>" + dst;
+          const e = edges.get(k);
+          if (e) e.weight += w;
+          else edges.set(k, { src, dst, weight: w });
+        };
+        for (const f of filesCapped) {
+          const targets = RL[f.path] || {};
+          for (const tp in targets) {
+            if (!targets[tp] || tp === f.path) continue;
+            if (cardRect.has(tp)) addEdge(f.path, tp, targets[tp]);
+            for (const pk of podKeys) {
+              if (tp === pk || tp.startsWith(pk + "/")) addEdge(f.path, pk + "/", 1);
+            }
+          }
+        }
+        for (const src in RL) {
+          for (const pk of podKeys) {
+            if (src.startsWith(pk + "/")) {
+              const targets = RL[src];
+              for (const tp in targets) {
+                if (!targets[tp]) continue;
+                if (cardRect.has(tp) && !tp.endsWith("/")) {
+                  addEdge(pk + "/", tp, 1);
+                } else {
+                  for (const pk2 of podKeys) {
+                    if (pk2 !== pk && (tp === pk2 || tp.startsWith(pk2 + "/"))) {
+                      addEdge(pk + "/", pk2 + "/", 1);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        const merged = [];
+        const seen = new Set();
+        for (const [k, e] of [...edges.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+          if (seen.has(k)) continue;
+          const rev = e.dst + "=>" + e.src;
+          const r = edges.get(rev);
+          seen.add(k);
+          if (r) {
+            seen.add(rev);
+            merged.push({ a: e.src, b: e.dst, weight: e.weight + r.weight, mutual: true });
+          } else {
+            merged.push({ a: e.src, b: e.dst, weight: e.weight, mutual: false });
+          }
+        }
+        merged.sort((x, y) => y.weight - x.weight || (x.a + x.b < y.a + y.b ? -1 : 1));
+        const drawn = merged.slice(0, CFG.maxLinks);
+        if (merged.length > CFG.maxLinks) {
+          new Notice("Fractal Index: " + merged.length + " note links found; drawing the strongest " + CFG.maxLinks + ".");
+        }
+        const anchor = (r, toward) => {
+          const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+          const dx = toward.x + toward.w / 2 - cx, dy = toward.y + toward.h / 2 - cy;
+          if (!dx && !dy) return [cx, cy];
+          const sx = dx ? (r.w / 2) / Math.abs(dx) : Infinity;
+          const sy = dy ? (r.h / 2) / Math.abs(dy) : Infinity;
+          const s = Math.min(sx, sy);
+          return [cx + dx * s, cy + dy * s];
+        };
+        ea.setStyle({ strokeColor: CFG.colors.link, strokeStyle: "solid" });
+        for (const e of drawn) {
+          const ra = cardRect.get(e.a), rb = cardRect.get(e.b);
+          if (!ra || !rb) continue;
+          const p1 = anchor(ra, rb), p2 = anchor(rb, ra);
+          const key = "link|" + e.a + "=>" + e.b;
+          const aId = ea.addArrow([p1, p2], {
+            strokeColor: CFG.colors.link,
+            strokeWidth: 1,
+            startArrowHead: e.mutual ? "arrow" : null,
+            endArrowHead: "arrow",
+          });
+          stamp(aId, key, basename(e.a), "link", 0);
+        }
+      }
+
       /* ── org-chart spine + orthogonal (elbowed) stub arrows into each pod ── */
       ea.setStyle({ strokeColor: CFG.colors.arrow, strokeStyle: "dashed" });
       if (subfoldersCapped.length) {
