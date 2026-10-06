@@ -311,10 +311,20 @@ try {
           stamp(hintId, key + "|hint", sf.name, "hint", slot);
         }
 
+        ea.setStyle({ fontFamily: 2, fontSize: 14, strokeColor: CFG.colors.link });
+        const diveId = sid(key + "|dive");
+        ea.addText(
+          x + CFG.pod.w - 150, y + CFG.pod.h - 26,
+          "⤢ click pod to dive",
+          { textAlign: "right" },
+          diveId
+        );
+        stamp(diveId, key + "|dive", sf.name, "dive-hint", slot);
+
         try {
           if (typeof ea.addToGroup === "function") {
             // move any pod element → the whole pod moves with it
-            ea.addToGroup([fid, motifId, labelId, embId || hintId].filter(Boolean));
+            ea.addToGroup([fid, motifId, labelId, embId || hintId, diveId].filter(Boolean));
           }
         } catch (e) { /* grouping is a convenience; never fail generation for it */ }
       }
