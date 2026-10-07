@@ -49,6 +49,7 @@ const CFG = {
   indexName: "_index.excalidraw.md",
   maxItems: 500,
   maxLinks: 60,
+  layoutVersion: 3, // bump to re-layout existing maps with the new engine (v3: balanced square grid + orientation spines)
   direction: "TD", // "TD" = top-down (hierarchy, default) | "LR" = left-right (journey)
   fileCard: { w: 230, h: 64, cols: 5, gx: 36, gy: 26, fontSize: 20, wrapAt: 26 },
   pod: { w: 380, h: 300, gapY: 60, gapX: 60, fontSize: 26 },
@@ -85,12 +86,20 @@ function basename(p) { const s = p.split("/").pop(); return s; }
    by content. Falls back to the deterministic grid when offline.
    After first placement, the adoption system preserves positions forever. */
 function loadElk() {
+  // elkjs bundled build exposes global `ELK` (not `elk`). Hard 8s cap so a
+  // blocked/stalled CDN can never hang a run — grid fallback takes over.
   return new Promise((resolve) => {
-    if (globalThis.elk) return resolve(globalThis.elk);
-    if (typeof document === "undefined" || !document.head) return resolve(null); // Node/test env
+    const done = (v) => resolve(v ? new v() : null);
+    const Ctor = globalThis.ELK || globalThis.elk;
+    if (Ctor) return done(Ctor);
+    if (typeof document === "undefined" || !document.head) return resolve(null);
+    const timer = setTimeout(() => resolve(null), 8000);
     const script = document.createElement("script");
-    script.onload = () => resolve(globalThis.elk || null);
-    script.onerror = () => resolve(null);
+    script.onload = () => {
+      clearTimeout(timer);
+      done(globalThis.ELK || globalThis.elk || null);
+    };
+    script.onerror = () => { clearTimeout(timer); resolve(null); };
     script.src = "https://cdn.jsdelivr.net/npm/elkjs@0.8.2/lib/elk.bundled.min.js";
     document.head.appendChild(script);
   });
@@ -150,7 +159,10 @@ async function computeElkLayout(files, subfolders, resolvedLinks, podContentCoun
       children,
       edges,
     };
-    const result = await elk.layout(graph);
+    const result = await Promise.race([
+      elk.layout(graph),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("elk layout timeout")), 15000)),
+    ]);
     const positions = new Map();
     for (const ch of result.children || []) {
       positions.set(ch.id, { x: ch.x, y: ch.y, width: ch.width, height: ch.height });
@@ -203,7 +215,7 @@ try {
     const folder = indexFile.parent || app.vault.getRoot();
 
     // when Fractal Sync drives this script, options arrive via window flag (no prompts)
-    const syncOpts = (typeof window !== "undefined" && globalThis.__fractalSyncOptions) || null;
+    const syncOpts = globalThis.__fractalSyncOptions || null;
     let scope, drawLinks, direction;
     if (syncOpts) {
       scope = syncOpts.scope;
@@ -289,18 +301,24 @@ try {
       const consumed = new Set();
       const hiWater = { pod: -1, file: -1 };
       const prevPos = new Map(); // key → {x,y}: MANUAL MOVES are adopted as truth
+      // layout versioning: when the layout engine improves, old maps re-layout
+      // once (positions from an older engine are not worth preserving)
+      const prevTitle = prevEls.find((el) => el.customData && el.customData.kind === "title");
+      const versionMatch = prevTitle && prevTitle.customData.layoutVersion === CFG.layoutVersion;
       for (const el of prevEls) {
         const cd = el.customData || {};
         const space = String(cd.key || "").split("|")[0];
         if (space in hiWater && typeof cd.slot === "number") {
           hiWater[space] = Math.max(hiWater[space], cd.slot);
         }
+        if (!versionMatch) continue; // stale engine: positions discarded
         if (cd.kind === "file" && typeof el.x === "number") prevPos.set(cd.key, { x: el.x, y: el.y });
         if (cd.kind === "frame" && cd.key && cd.key.startsWith("pod|") && cd.key.endsWith("|frame")) {
           const podPath = cd.key.slice(4, -6); // strip "pod|" and "|frame"
           prevPos.set("pod|" + podPath, { x: el.x, y: el.y });
         }
       }
+      if (!versionMatch) prevByKey.clear(); // cold start: fresh slots for everything
       const nextSlot = (space) => ++hiWater[space];
 
       /* adopt a slot: exact key match → basename-orphan match (same space) → fresh slot */
@@ -355,7 +373,7 @@ try {
       stamp(titleId, titleKey, folder.name, "title", 0);
       // store direction choice on the title element so regeneration preserves it
       const titleEl = ea.getElement(titleId);
-      if (titleEl) titleEl.customData = { ...titleEl.customData, direction };
+      if (titleEl) titleEl.customData = { ...titleEl.customData, direction, layoutVersion: CFG.layoutVersion };
 
       /* breadcrumb up to parent index when it exists */
       const parentIndexPath = isRootFolder
@@ -371,24 +389,34 @@ try {
         ea.getElement(bcId).link = wl(parentIndexPath);
       }
 
-      /* ── layout: branch on direction (TD = hierarchy / LR = journey) ── */
-      const slotPos = direction === "LR"
-        ? {
-            // LR: pods side-by-side, files in a grid below the pod row
-            pod: (s) => ({ x: s * (CFG.pod.w + CFG.pod.gapX), y: CFG.gridY0 }),
-            file: (s) => ({
-              x: (s % CFG.fileCard.cols) * (CFG.fileCard.w + CFG.fileCard.gx),
-              y: CFG.gridY0 + CFG.pod.h + 80 + Math.floor(s / CFG.fileCard.cols) * (CFG.fileCard.h + CFG.fileCard.gy),
+      /* ── layout: balanced square grid in both directions ──
+         Pods pack into a near-square grid (3 pods -> 2x2, 8 -> 3x3): no
+         endless columns, no thin one-line strips. Direction changes the
+         spine side and reading order: TD = rows, spine above; LR = columns,
+         spine on the left. Files sit below the pod area either way. */
+      const podCount = subfoldersCapped.length;
+      const podCols = Math.max(1, Math.min(podCount, Math.ceil(Math.sqrt(podCount))));
+      const podRows = Math.ceil(podCount / podCols);
+      const podsBottom = CFG.gridY0 + podRows * (CFG.pod.h + CFG.pod.gapY) - CFG.pod.gapY;
+      const fileCols = Math.max(CFG.fileCard.cols, podCols);
+      const slotPos = {
+        pod: direction === "LR"
+          ? (s) => {
+              // LR: column-major fill (journey reads down each column)
+              return {
+                x: Math.floor(s / podRows) * (CFG.pod.w + CFG.pod.gapX),
+                y: CFG.gridY0 + (s % podRows) * (CFG.pod.h + CFG.pod.gapY),
+              };
+            }
+          : (s) => ({
+              x: (s % podCols) * (CFG.pod.w + CFG.pod.gapX),
+              y: CFG.gridY0 + Math.floor(s / podCols) * (CFG.pod.h + CFG.pod.gapY),
             }),
-          }
-        : {
-            // TD (default): pods stacked vertically, files in a grid to the right
-            pod: (s) => ({ x: 0, y: CFG.gridY0 + s * (CFG.pod.h + CFG.pod.gapY) }),
-            file: (s) => ({
-              x: CFG.gridX0 + (s % CFG.fileCard.cols) * (CFG.fileCard.w + CFG.fileCard.gx),
-              y: CFG.gridY0 + Math.floor(s / CFG.fileCard.cols) * (CFG.fileCard.h + CFG.fileCard.gy),
-            }),
-          };
+        file: (s) => ({
+          x: 40 + (s % fileCols) * (CFG.fileCard.w + CFG.fileCard.gx),
+          y: podsBottom + 80 + Math.floor(s / fileCols) * (CFG.fileCard.h + CFG.fileCard.gy),
+        }),
+      };
       const podSlots = new Map(); // subfolder path → slot (for arrows)
 
       const podOrigin = new Map(); // final pod origin after move-adoption
@@ -403,7 +431,7 @@ try {
         podOrigin.set(sf.path, { x, y });
         const idx = subIndexByPath.get(sf.path);
 
-        const fid = ea.addFrame(x, y, CFG.pod.w, CFG.pod.h, " "); // space name: suppress the default Frame label
+        const fid = ea.addFrame(x, y, CFG.pod.w, CFG.pod.h);
         stamp(fid, key + "|frame", sf.name, "frame", slot);
 
         // concentric inner border — the visual "recursion" motif
@@ -440,7 +468,7 @@ try {
         ea.setStyle({ fontFamily: 2, fontSize: 14, strokeColor: CFG.colors.link });
         const diveId = sid(key + "|dive");
         ea.addText(
-          x + CFG.pod.w - 150, y + CFG.pod.h - 26,
+          x + CFG.pod.w - 150, y - 24,
           "⤢ click pod to dive",
           { textAlign: "right" },
           diveId
@@ -635,53 +663,55 @@ try {
         }
       }
 
-      /* ── org-chart spine + orthogonal (elbowed) stub arrows into each pod ──
-         Elbowed routing is the Mermaid/ELK convention for hierarchy: clean
-         right angles instead of diagonals when a pod has been moved.
-         Direction-aware: TD = vertical spine on the left, stubs go right.
-         LR = horizontal spine above, stubs go down. */
+      /* ── spine + orthogonal stubs, orientation by direction ──
+         TD: horizontal spine above the grid, vertical stubs into first-row pods.
+         LR: vertical spine left of the grid, horizontal stubs into first-column
+         pods (journey reads down each column). */
       ea.setStyle({ strokeColor: CFG.colors.arrow, strokeStyle: "dashed" });
       if (subfoldersCapped.length) {
+        const origins = subfoldersCapped.map((sf) => podOrigin.get(sf.path) || slotPos.pod(podSlots.get(sf.path)));
         if (direction === "LR") {
-          // horizontal spine above the pods, vertical stubs dropping down
+          const spineX = -40;
+          const cys = origins.map((o) => o.y + CFG.pod.h / 2);
+          const lastY = Math.max(...cys);
+          const spineId = ea.addArrow(
+            [[spineX, CFG.gridY0], [spineX, lastY]],
+            { startArrowHead: null, endArrowHead: null, strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
+          );
+          stamp(spineId, "spine|" + folder.path, folder.name, "spine", 0);
+          subfoldersCapped.forEach((sf, i) => {
+            const key = "pod|" + sf.path;
+            const o = origins[i];
+            const colX = Math.min(...origins.map((o2) => o2.x));
+            if (o.x > colX + 40) return; // later columns: no stub
+            const cy = o.y + CFG.pod.h / 2;
+            const aId = ea.addArrow(
+              [[spineX, cy], [o.x - 4, cy]],
+              { startArrowHead: null, endArrowHead: "arrow", strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
+            );
+            stamp(aId, key + "|arrow", sf.name, "arrow", i);
+          });
+        } else {
           const spineY = CFG.gridY0 - 40;
-          const xs = subfoldersCapped.map((sf) => (podOrigin.get(sf.path) || slotPos.pod(podSlots.get(sf.path))).x + CFG.pod.w / 2);
-          const lastX = Math.max(...xs);
+          const centers = origins.map((o) => o.x + CFG.pod.w / 2);
+          const lastX = Math.max(...centers);
           const spineId = ea.addArrow(
             [[0, spineY], [lastX, spineY]],
             { startArrowHead: null, endArrowHead: null, strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
           );
           stamp(spineId, "spine|" + folder.path, folder.name, "spine", 0);
-          for (const sf of subfoldersCapped) {
+          subfoldersCapped.forEach((sf, i) => {
             const key = "pod|" + sf.path;
-            const slot = podSlots.get(sf.path);
-            const origin = podOrigin.get(sf.path) || slotPos.pod(slot);
+            const o = origins[i];
+            const rowY = Math.min(...origins.map((o2) => o2.y));
+            if (o.y > rowY + 40) return; // later rows: no stub
+            const cx = o.x + CFG.pod.w / 2;
             const aId = ea.addArrow(
-              [[origin.x + CFG.pod.w / 2, spineY], [origin.x + CFG.pod.w / 2, origin.y - 4]],
+              [[cx, spineY], [cx, o.y - 4]],
               { startArrowHead: null, endArrowHead: "arrow", strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
             );
-            stamp(aId, key + "|arrow", sf.name, "arrow", slot);
-          }
-        } else {
-          // TD (default): vertical spine on the left, horizontal stubs into pods
-          const spineX = -40;
-          const ys = subfoldersCapped.map((sf) => (podOrigin.get(sf.path) || slotPos.pod(podSlots.get(sf.path))).y + 18);
-          const lastY = Math.max(...ys);
-          const spineId = ea.addArrow(
-            [[spineX, 40], [spineX, lastY]],
-            { startArrowHead: null, endArrowHead: null, strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
-          );
-          stamp(spineId, "spine|" + folder.path, folder.name, "spine", 0);
-          for (const sf of subfoldersCapped) {
-            const key = "pod|" + sf.path;
-            const slot = podSlots.get(sf.path);
-            const origin = podOrigin.get(sf.path) || slotPos.pod(slot);
-            const aId = ea.addArrow(
-              [[spineX, origin.y + 18], [origin.x + 16, origin.y + 18]],
-              { startArrowHead: null, endArrowHead: "arrow", strokeStyle: "dashed", strokeColor: CFG.colors.arrow, elbowed: true }
-            );
-            stamp(aId, key + "|arrow", sf.name, "arrow", slot);
-          }
+            stamp(aId, key + "|arrow", sf.name, "arrow", i);
+          });
         }
       }
 
