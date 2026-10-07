@@ -72,7 +72,7 @@ function zoomToEmbed(view, el) {
   setTimeout(() => {
     try {
       if (typeof view.zoomToElementId === "function") {
-        view.zoomToElementId(el.id, false).catch((e) => console.error("dive failed", e));
+        Promise.resolve(view.zoomToElementId(el.id, false)).catch((e) => console.error("dive failed", e));
         return;
       }
       const api = view.excalidrawAPI || (view.getExcalidrawAPI ? view.getExcalidrawAPI() : null);
@@ -178,21 +178,50 @@ function idealLinkPoints(elements, arrow) {
   return [anchorPoint(ra, rb), anchorPoint(rb, ra)];
 }
 
-function idealStubPoints(elements, arrow) {
-  const key = String((arrow.customData || {}).key || "");
-  if (!key.startsWith("pod|") || !key.endsWith("|arrow")) return null;
-  const label = elements.find((el) => el.customData && el.customData.key === key.replace(/\|arrow$/, "|label") && !el.isDeleted);
-  if (!label) return null;
-  return [[-40, label.y + 18], [label.x - 4, label.y + 18]];
+function mapDirection(elements) {
+  const title = elements.find((el) => !el.isDeleted && el.customData && el.customData.kind === "title");
+  return title && title.customData.direction === "LR" ? "LR" : "TD";
 }
 
-function idealSpinePoints(elements) {
+function idealStubPoints(elements, arrow, direction) {
+  // Geometry matches the v3 generator: balanced square grid in both
+  // directions. TD: horizontal spine above at y=120, vertical stubs into
+  // first-row pods. LR: vertical spine at x=-40, horizontal stubs into
+  // first-column pods. The pod label sits at (podX+16, podY+14);
+  // pod w=380, h=300.
+  const key = String((arrow.customData || {}).key || "");
+  if (!key.startsWith("pod|") || !key.endsWith("|arrow")) return null;
   const labels = elements.filter(
     (el) => el.customData && el.customData.kind === "pod-label" && !el.isDeleted
   );
   if (!labels.length) return null;
-  const lastY = Math.max(...labels.map((l) => l.y + 18));
-  return [[-40, 40], [-40, lastY]];
+  const label = labels.find((el) => el.customData.key === key.replace(/\|arrow$/, "|label"));
+  if (!label) return null;
+  if (direction === "LR") {
+    const minX = Math.min(...labels.map((l) => l.x));
+    if (label.x > minX + 40) return null; // later columns: no stub
+    const cy = label.y - 14 + 150;
+    return [[-40, cy], [label.x - 20, cy]];
+  }
+  const minY = Math.min(...labels.map((l) => l.y));
+  if (label.y > minY + 40) return null; // later rows: no stub
+  const cx = label.x - 16 + 190;
+  return [[cx, 120], [cx, label.y - 18]];
+}
+
+function idealSpinePoints(elements, direction) {
+  const labels = elements.filter(
+    (el) => el.customData && el.customData.kind === "pod-label" && !el.isDeleted
+  );
+  if (!labels.length) return null;
+  if (direction === "LR") {
+    const minX = Math.min(...labels.map((l) => l.x));
+    const firstCol = labels.filter((l) => l.x <= minX + 40);
+    const lastCy = Math.max(...firstCol.map((l) => l.y - 14 + 150));
+    return [[-40, 160], [-40, lastCy]];
+  }
+  const lastX = Math.max(...labels.map((l) => l.x - 16 + 190));
+  return [[0, 120], [lastX, 120]];
 }
 
 function samePoints(a, b) {
@@ -212,6 +241,7 @@ function reanchorNow(elements, appState, view) {
     const isFractal = elements.some((el) => el.customData && el.customData.fractalIndex);
     if (!isFractal) return;
     const selected = (appState && appState.selectedElementIds) || {};
+    const direction = mapDirection(elements);
     const updates = new Map(); // id → ideal absolute points
     for (const el of elements) {
       if (el.isDeleted || !el.customData || !el.customData.fractalIndex) continue;
@@ -219,8 +249,8 @@ function reanchorNow(elements, appState, view) {
       if (selected[el.id]) continue; // user is dragging this arrow — hands off
       const ideal =
         el.customData.kind === "link" ? idealLinkPoints(elements, el) :
-        el.customData.kind === "arrow" ? idealStubPoints(elements, el) :
-        idealSpinePoints(elements);
+        el.customData.kind === "arrow" ? idealStubPoints(elements, el, direction) :
+        idealSpinePoints(elements, direction);
       const current = (el.points || []).map((p) => [p[0] + el.x, p[1] + el.y]);
       if (!ideal || samePoints(current, ideal)) continue;
       updates.set(el.id, ideal);
